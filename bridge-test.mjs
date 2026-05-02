@@ -36,28 +36,43 @@ const BACKSWING_MS       = 1200;
 const PAUSE_MS           = 200;
 const DOWNSWING_MS       = 600;
 const FOLLOWTHRU_MS      = 400;
-const BACK_AMP_DEG       = 180;
-const FOLLOW_AMP_DEG     = 35;
+const BACK_AMP_DEG       = 160;
+const FOLLOW_AMP_DEG     = 30;
 const PEAK_G_PER_MS      = 0.15;
 const MAX_PEAK_G         = 10.0;
 const GYRO_INTENSITY_LO  = 1.40;
 const GYRO_INTENSITY_HI  = 1.80;
 
 // ─── Curve tuning (NEW — under test) ──────────────────────────────────────
-// LaunchDirection in deg drives a side-axis lean+twist during downswing+impact.
-// Tuneable: start small and sweep up via CURVE_GAIN env var.
-//   CURVE_GAIN=1.0 → default. Raise to make a given LaunchDirection produce
-//   a more pronounced curve in-game.
-const CURVE_GAIN     = parseFloat(process.env.CURVE_GAIN ?? "1.0");
-// Max X-axis accel bias during impact, in g, at LaunchDirection = ±20° (full
-// scale). Linear in direction, clipped at ±MAX_DIR_DEG.
-const CURVE_AX_MAX_G = 0.6 * CURVE_GAIN;
-// Roll-axis (clubface twist) gyro bias during downswing+impact, in deg/s, at
-// full-scale direction.
-const CURVE_ROLL_MAX_DPS = 250 * CURVE_GAIN;
-const MAX_DIR_DEG = 20;
+// Original WS Golf has NO MotionPlus / no gyro — only accel + IR. So the
+// curve mechanism must be a sustained X-axis component throughout the
+// downswing, not a gyro twist or an impact-instant spike.
+//
+// Approach: rotate the swing-plane gravity around the forward (Z) axis by
+// an angle proportional to LaunchDirection. This makes the wiimote behave
+// as if held tilted through the entire swing, which is what produces
+// hook/slice in WS Golf.
+//
+// CURVE_GAIN scales the max tilt angle. Raise to make a given
+// LaunchDirection produce more pronounced curve in-game.
+const CURVE_GAIN       = parseFloat(process.env.CURVE_GAIN ?? "1.0");
+const MAX_DIR_DEG      = 20;                          // clip LaunchDirection at ±20°
+const MAX_TILT_DEG     = 25 * CURVE_GAIN;             // max swing-plane tilt at ±MAX_DIR_DEG
+const MAX_TILT_RAD     = MAX_TILT_DEG * Math.PI / 180;
 
-console.log(`[cfg] CURVE_GAIN=${CURVE_GAIN}  AX_MAX=${CURVE_AX_MAX_G.toFixed(2)}g  ROLL_MAX=${CURVE_ROLL_MAX_DPS.toFixed(0)}dps`);
+// ─── Per-club scaling table ────────────────────────────────────────────────
+// `speedTarget` = BallSpeed (m/s) at which the in-game power bar should hit
+// full (4 bars). Anchored on PGA Tour averages so a tour-pro shot maxes the
+// bar without red-lining.
+const CLUB_TABLE = {
+  driver: { speedTarget: 77 },   // tour avg ball speed
+  iron:   { speedTarget: 56 },   // 7-iron tour avg
+  wedge:  { speedTarget: 45 },   // PW tour avg
+  putter: { speedTarget: 8  },   // arbitrary; putts are slow regardless
+};
+
+console.log(`[cfg] CURVE_GAIN=${CURVE_GAIN}  MAX_TILT=${MAX_TILT_DEG.toFixed(1)}° at LaunchDirection=±${MAX_DIR_DEG}°`);
+console.log(`[cfg] club targets: driver=${CLUB_TABLE.driver.speedTarget} iron=${CLUB_TABLE.iron.speedTarget} wedge=${CLUB_TABLE.wedge.speedTarget} putter=${CLUB_TABLE.putter.speedTarget} (m/s ball speed → 4 bars)`);
 
 // ─── DSU protocol (identical to bridge.mjs) ───────────────────────────────
 const MSG_VERSION = 0x100000, MSG_INFO = 0x100001, MSG_DATA = 0x100002;
@@ -104,10 +119,17 @@ function buildDataPayload(slot, accel, gyro, buttons2 = 0) {
   slotInfoPayload(slot, true).copy(p, 0, 0, 11);
   p.writeUInt8(1, 11);
   p.writeUInt32LE(++packetCounter, 12);
-  p.writeUInt8(0, 16);
+  p.writeUInt8(buttons1, 16);
   p.writeUInt8(buttons2, 17);
   p.writeUInt8(128, 20); p.writeUInt8(128, 21);
   p.writeUInt8(128, 22); p.writeUInt8(128, 23);
+  // Analog DPad pressures (bytes 24-27) — Dolphin's DSU client reads these
+  // for D-pad input, not the bit flags in byte 16 alone.
+  // 24 = Pad N (Up), 25 = Pad E (Right), 26 = Pad S (Down), 27 = Pad W (Left)
+  if (buttons1 & 0x10) p.writeUInt8(0xff, 24);
+  if (buttons1 & 0x20) p.writeUInt8(0xff, 25);
+  if (buttons1 & 0x40) p.writeUInt8(0xff, 26);
+  if (buttons1 & 0x80) p.writeUInt8(0xff, 27);
   if (buttons2 & 0x01) p.writeUInt8(0xff, 28);
   if (buttons2 & 0x02) p.writeUInt8(0xff, 29);
   if (buttons2 & 0x04) p.writeUInt8(0xff, 30);
@@ -125,10 +147,27 @@ function buildDataPacket(slot, accel, gyro, buttons2) {
   return buildServerPacket(MSG_DATA, buildDataPayload(slot, accel, gyro, buttons2));
 }
 
+// ─── Rest pose (overridable via POST /rest-pose) ──────────────────────────
+// Default (0, +1, 0) — matches the swing motion's theta=0 pose so there's
+// no discontinuity at swing start/end.
+let restPose = { x: 0, y: 1, z: 0 };
+
+// D-pad state — for WS Golf aim arrow control. POST /aim sets this for
+// a duration, then it clears. Bits per cemuhook DSU spec: 0x10=Up,
+// 0x20=Right, 0x40=Down, 0x80=Left.
+let buttons1 = 0;
+
 // ─── Swing state machine ───────────────────────────────────────────────────
 let swing = null;
 
 function triggerSwing(shot, source = "trackman") {
+  // Reject if a swing is still in flight — otherwise the new swing
+  // replaces the old one mid-motion and the wiimote pose hard-jumps.
+  if (swing !== null) {
+    console.log(`[swing] rejected — already swinging (${swing.source})`);
+    return false;
+  }
+
   const profile = {
     kind: "full",
     backswingMs:  BACKSWING_MS,
@@ -143,32 +182,42 @@ function triggerSwing(shot, source = "trackman") {
     maxPeakG:     MAX_PEAK_G,
   };
 
+  const club = (shot.Club ?? "driver").toLowerCase();
+  const target = (CLUB_TABLE[club] ?? CLUB_TABLE.driver).speedTarget;
+
+  // Two-tier scaling. powerRatio drives follow-through + impact — runs
+  // wide-open up to 1.50 so 100 m/s shots hit much harder than 77 m/s.
+  // ampRatio drives backswing depth — capped at 1.00 because past that
+  // the game aborts mid-backswing. Lower floor (0.25) widens the low
+  // end too: 30 m/s now sends a much smaller backswing than 77.
+  const rawRatio = Math.max(0, Math.min(1.05, shot.BallSpeed / target));
+  const speedRatio = 0.40 + 0.60 * rawRatio;
+  profile.backAmpDeg   *= speedRatio;
+  profile.followAmpDeg *= speedRatio;
+
   const peakG = Math.min(profile.maxPeakG, shot.BallSpeed * profile.peakGPerMs);
 
-  let ampScale;
-  if (shot.BallSpeed < 4.0)         ampScale = 0.25;
-  else if (shot.BallSpeed < 15.0)   ampScale = 0.45 + 0.025 * (shot.BallSpeed - 5.0);
-  else                              ampScale = Math.max(0.50, Math.min(1.0, shot.BallSpeed / 60));
-  profile.backAmpDeg   *= ampScale;
-  profile.followAmpDeg *= ampScale;
-
-  const dirDeg = Math.max(-MAX_DIR_DEG, Math.min(MAX_DIR_DEG, shot.LaunchDirection ?? 0));
-  const dirNorm = dirDeg / MAX_DIR_DEG; // -1..+1
+  const dirDeg  = Math.max(-MAX_DIR_DEG, Math.min(MAX_DIR_DEG, shot.LaunchDirection ?? 0));
+  const dirNorm = dirDeg / MAX_DIR_DEG;
+  const tiltRad = dirNorm * MAX_TILT_RAD;     // signed swing-plane tilt
 
   swing = {
     startedAt: Date.now(),
     peakG,
-    dirNorm,
+    tiltRad,
+    speedRatio,
     ballSpeed: shot.BallSpeed,
+    club,
     profile,
     source,
   };
-  console.log(`[swing] (${source}) BallSpeed=${shot.BallSpeed.toFixed(1)} dir=${dirDeg.toFixed(1)}deg dirNorm=${dirNorm.toFixed(2)} peakG=${peakG.toFixed(2)} amp=${ampScale.toFixed(2)}`);
+  console.log(`[swing] (${source}) club=${club} BallSpeed=${shot.BallSpeed.toFixed(1)}m/s ratio=${speedRatio.toFixed(2)} backAmp=${profile.backAmpDeg.toFixed(0)}° followAmp=${profile.followAmpDeg.toFixed(0)}° peakG=${peakG.toFixed(2)}`);
+  return true;
 }
 
 function motion() {
   const neutral = {
-    accel: { x: 0, y: 1, z: 0 },
+    accel: { x: restPose.x, y: restPose.y, z: restPose.z },
     gyro:  { pitch: 0, yaw: 0, roll: 0 },
     buttons2: 0,
   };
@@ -217,39 +266,51 @@ function motion() {
 
   const HAND_RADIUS_M = 2.5;
   const G = 9.81;
-  const speedGain = Math.max(0.50, Math.min(1.0, swing.ballSpeed / 70));
-  const CENTRIPETAL_GAIN = 2.5 * speedGain;
+  const CENTRIPETAL_GAIN = 2.5 * Math.max(0.5, swing.speedRatio);
   const centripetalG = CENTRIPETAL_GAIN * (omega * omega * HAND_RADIUS_M) / G;
   ay += centripetalG;
 
-  // Impact transient
-  const impactWidthMs = 35;
+  // Impact transient. Default = forward Z spike + slight downward Y yank.
+  // For sweep E (impact axis testing), swing.impactAxis can override to
+  // route the spike to Y or X instead.
+  const impactWidthMs = swing.impactWidthMs ?? 35;
   const dtMs = tMs - tDownEnd;
   if (Math.abs(dtMs) < impactWidthMs) {
     const shape = Math.pow(Math.cos((Math.PI / 2) * (dtMs / impactWidthMs)), 2);
-    az += swing.peakG * shape;
-    ay -= swing.peakG * 0.25 * shape;
-    // ─── CURVE: X-axis accel bias at impact ─────────────────────────────
-    // Positive LaunchDirection (right) → +X tilt at impact, which the game
-    // should read as a fade/slice. Negative dir → −X tilt → draw/hook.
-    ax += CURVE_AX_MAX_G * swing.dirNorm * shape;
+    const axis = swing.impactAxis ?? 'z';
+    if (axis === 'z') {
+      az += swing.peakG * shape;
+      ay -= swing.peakG * 0.25 * shape;
+    } else if (axis === 'y') {
+      ay += swing.peakG * shape;
+    } else if (axis === 'x') {
+      ax += swing.peakG * shape;
+    }
   }
 
-  // ─── CURVE: roll-axis twist during downswing ramp ─────────────────────
-  // A pronated wrist at impact in a real swing closes the face → hook.
-  // Mirror that: ramp up roll-gyro through downswing, peaking at impact.
-  let rollBias = 0;
-  if (phase === "down") {
-    const u = (tMs - tPauseEnd) / p.downswingMs;
-    rollBias = CURVE_ROLL_MAX_DPS * swing.dirNorm * Math.sin(Math.PI * u);
+  // ─── CURVE: rotate (ax, ay) around Z by tiltRad through downswing+impact ─
+  // Original WS Golf reads accel only — so the wiimote needs a SUSTAINED
+  // lateral component, not an impact-instant spike. Rotating the swing-plane
+  // accel pair around the forward axis simulates the wiimote being held
+  // tilted left/right throughout the swing, which is what produces hook/slice.
+  // No tilt during back/pause phases (still a square setup), only ramps in
+  // for the downswing+impact+follow-through.
+  if (phase === "down" || phase === "follow") {
+    const a = swing.tiltRad;
+    const c = Math.cos(a), s = Math.sin(a);
+    const axNew = ax * c - ay * s;
+    const ayNew = ax * s + ay * c;
+    ax = axNew; ay = ayNew;
   }
 
+  // Pitch gyro is included for any DSU consumer that reads it — original WS
+  // Golf ignores it (no MotionPlus), but harmless to send.
   const intensityScale = p.gyroLo + (p.gyroHi - p.gyroLo) * (swing.peakG / p.maxPeakG);
   const gyroVal = omega * (180 / Math.PI) * intensityScale;
 
   return {
     accel: { x: ax, y: ay, z: az },
-    gyro:  { pitch: gyroVal, yaw: 0, roll: rollBias },
+    gyro:  { pitch: gyroVal, yaw: 0, roll: 0 },
     buttons2: 0x04 | 0x20,
   };
 }
@@ -319,12 +380,118 @@ http.createServer((req, res) => {
   }
   if (req.method === "GET" && req.url === "/state") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ swinging: !!swing, swing }));
+    res.end(JSON.stringify({ swinging: !!swing, swing, restPose }));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/inject-raw") {
+    // Bypasses ALL per-shot scaling. Caller specifies every motion knob
+    // directly so we can isolate which one drives the bar.
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", () => {
+      try {
+        if (swing !== null) {
+          res.writeHead(409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "swing in flight" }));
+          return;
+        }
+        const r = JSON.parse(body);
+        const profile = {
+          kind:         "raw",
+          backswingMs:  r.backMs   ?? 1200,
+          pauseMs:      r.pause    ?? 200,
+          downswingMs:  r.downMs   ?? 600,
+          followthruMs: r.followMs ?? 400,
+          backAmpDeg:   r.backAmp  ?? 100,
+          followAmpDeg: r.follow   ?? 30,
+          gyroLo:       1.40,
+          gyroHi:       1.80,
+          maxPeakG:     20,        // raised so peakG isn't capped during sweep D
+          peakGPerMs:   0,
+        };
+        swing = {
+          startedAt:      Date.now(),
+          peakG:          r.peakG ?? 5,
+          // tiltDeg in degrees (signed; negative=L, positive=R). Rotates
+          // the (ax,ay) accel pair around Z by this angle through downswing
+          // + follow phases — simulates the wiimote being held tilted
+          // sideways through the swing (real-WSGolf hook/slice mechanic).
+          tiltRad:        ((r.tiltDeg ?? 0) * Math.PI) / 180,
+          // speedRatio drives the centripetal multiplier inside motion().
+          // CENTRIPETAL_GAIN = 2.5 * max(0.5, speedRatio). Default 1.0 here
+          // so raw mode gets the same gain as a tour-avg shot, unless caller
+          // overrides via centripetalSpeedRatio.
+          speedRatio:     r.centripetalSpeedRatio ?? 1.0,
+          ballSpeed:      0,
+          club:           "raw",
+          profile,
+          source:         "inject-raw",
+          impactAxis:     r.impactAxis ?? "z",
+          impactWidthMs:  r.impactWidthMs,
+        };
+        console.log(`[swing] (raw) backAmp=${profile.backAmpDeg}° pause=${profile.pauseMs}ms follow=${profile.followAmpDeg}° peakG=${swing.peakG}g axis=${swing.impactAxis} backMs=${profile.backswingMs} downMs=${profile.downswingMs} followMs=${profile.followthruMs}`);
+        shotLog.write(JSON.stringify({ ts: Date.now(), source: "inject-raw", ...r }) + "\n");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, fired: { profile, peakG: swing.peakG, impactAxis: swing.impactAxis } }));
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/aim") {
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", () => {
+      try {
+        const r = JSON.parse(body);
+        const bits = { up: 0x10, right: 0x20, down: 0x40, left: 0x80 };
+        const bit = bits[r.dir];
+        if (!bit) throw new Error("dir must be up/down/left/right");
+        const durationMs = Number.isFinite(r.durationMs) ? r.durationMs : 500;
+        buttons1 = bit;
+        console.log(`[aim] holding ${r.dir} (bit 0x${bit.toString(16)}) for ${durationMs}ms`);
+        setTimeout(() => {
+          buttons1 = 0;
+          console.log(`[aim] released`);
+        }, durationMs);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, dir: r.dir, durationMs }));
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/rest-pose") {
+    let body = "";
+    req.on("data", c => body += c);
+    req.on("end", () => {
+      try {
+        const p = JSON.parse(body);
+        if (p.reset) {
+          restPose = { x: 0, y: 1, z: 0 };
+        } else {
+          if ([p.x, p.y, p.z].some(v => typeof v !== "number")) {
+            throw new Error("x, y, z must be numbers");
+          }
+          restPose = { x: p.x, y: p.y, z: p.z };
+        }
+        console.log(`[rest] restPose = (${restPose.x}, ${restPose.y}, ${restPose.z})`);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, restPose }));
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
+    });
     return;
   }
   res.writeHead(404); res.end();
 }).listen(HTTP_PORT, "127.0.0.1", () => {
-  console.log(`[http] listening on 127.0.0.1:${HTTP_PORT}  (POST /inject, GET /state)`);
+  console.log(`[http] listening on 127.0.0.1:${HTTP_PORT}  (POST /inject, POST /inject-raw, GET /state, POST /rest-pose)`);
 });
 
 // ─── TrackMan side (optional) ─────────────────────────────────────────────
