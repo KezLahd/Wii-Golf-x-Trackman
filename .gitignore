@@ -1,0 +1,7 @@
+node_modules/
+*.log
+*.err
+*.bin
+shots.jsonl
+ws_capture.jsonl
+node/
